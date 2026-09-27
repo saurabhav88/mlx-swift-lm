@@ -905,7 +905,7 @@ public class Qwen35TextModelInner: Module {
         super.init()
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
         forward(inputs, cache: cache, applyFinalNorm: true)
     }
 
@@ -1226,7 +1226,7 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+    @ModuleInfo(key: "language_model") public var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)
