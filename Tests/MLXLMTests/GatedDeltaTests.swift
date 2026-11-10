@@ -258,4 +258,114 @@ public class GatedDeltaTests: XCTestCase {
         )
     }
 
+    /// Records what `gatedDeltaUpdate` hands a tape cache, and answers with
+    /// values no ordinary path can produce.
+    private final class TapeRecorder: GatedDeltaTapeCache {
+        var isArmed: Bool
+        let y: MLXArray
+        let nextState: MLXArray
+        let tape: MLXArray
+        private(set) var updates: [(q: MLXArray, state: MLXArray, mask: MLXArray?)] = []
+        private(set) var records: [(tape: MLXArray, k: MLXArray, g: MLXArray, qkv: MLXArray)] = []
+
+        init(isArmed: Bool, y: MLXArray, nextState: MLXArray, tape: MLXArray) {
+            self.isArmed = isArmed
+            self.y = y
+            self.nextState = nextState
+            self.tape = tape
+        }
+
+        func gatedDeltaWithTape(
+            q: MLXArray, k: MLXArray, v: MLXArray,
+            g: MLXArray, beta: MLXArray, state: MLXArray,
+            mask: MLXArray?
+        ) -> (MLXArray, MLXArray, MLXArray) {
+            updates.append((q, state, mask))
+            return (y, nextState, tape)
+        }
+
+        func recordTape(tape: MLXArray, k: MLXArray, g: MLXArray, qkv: MLXArray) {
+            records.append((tape, k, g, qkv))
+        }
+    }
+
+    private func isIdentical(_ lhs: MLXArray, _ rhs: MLXArray) -> Bool {
+        guard lhs.shape == rhs.shape, lhs.dtype == rhs.dtype else { return false }
+        return allClose(lhs.asType(.float32), rhs.asType(.float32), rtol: 0, atol: 0)
+            .item(Bool.self)
+    }
+
+    /// A tape cache that is absent or not armed must not change the answer.
+    ///
+    /// Every ordinary generation passes through this function. If a disarmed
+    /// cache were consulted, the model would produce different text with no
+    /// error.
+    func testGatedDeltaDisarmedTapeCacheLeavesTheUpdateUnchanged() throws {
+        let inputs = makeInputs()
+        let (yPlain, statePlain) = gatedDeltaUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v,
+            a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias
+        )
+        let recorder = TapeRecorder(
+            isArmed: false, y: MLXArray.zeros([1]), nextState: MLXArray.zeros([1]),
+            tape: MLXArray.zeros([1]))
+        let (yDisarmed, stateDisarmed) = gatedDeltaUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v,
+            a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias,
+            recordingCache: recorder
+        )
+        eval(yPlain, statePlain, yDisarmed, stateDisarmed)
+
+        XCTAssertTrue(isIdentical(yPlain, yDisarmed))
+        XCTAssertTrue(isIdentical(statePlain, stateDisarmed))
+        XCTAssertEqual(recorder.updates.count, 0)
+        XCTAssertEqual(recorder.records.count, 0)
+    }
+
+    /// An armed tape cache computes the update and receives one tape record.
+    ///
+    /// Speculative decoding rolls the recurrent state back from this tape. If
+    /// the wrong tensors were recorded, a rollback would rebuild a state the
+    /// model never had, and the text after it would be wrong with no error.
+    func testGatedDeltaArmedTapeCacheComputesAndRecordsOnce() throws {
+        let inputs = makeInputs()
+        let state = MLXArray.ones([1, 4, 16, 32], dtype: .bfloat16)
+        let mask = MLXArray.ones([1, 16])
+        let qkv = MLXArray.ones([1, 16, 8])
+        let recorder = TapeRecorder(
+            isArmed: true,
+            y: MLXArray.full([1, 16, 4, 16], values: MLXArray(Float(3))),
+            nextState: MLXArray.full([1, 4, 16, 32], values: MLXArray(Float(5))),
+            tape: MLXArray.full([1, 16, 4, 16], values: MLXArray(Float(7))))
+
+        let (y, nextState) = gatedDeltaUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v,
+            a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias,
+            state: state, mask: mask,
+            recordingCache: recorder, projectedQKV: qkv
+        )
+        eval(y, nextState)
+
+        XCTAssertEqual(recorder.updates.count, 1)
+        XCTAssertEqual(recorder.records.count, 1)
+        guard let update = recorder.updates.first, let record = recorder.records.first else {
+            return
+        }
+        XCTAssertTrue(isIdentical(update.q, inputs.q))
+        XCTAssertEqual(update.state.dtype, .float32, "The cache must receive the fp32 state.")
+        XCTAssertTrue(isIdentical(update.state, state.asType(.float32)))
+        XCTAssertNotNil(update.mask)
+        XCTAssertTrue(isIdentical(record.tape, recorder.tape))
+        XCTAssertTrue(isIdentical(record.k, inputs.k))
+        XCTAssertEqual(record.g.dtype, .float32)
+        XCTAssertEqual(record.g.shape, [1, 16, 4])
+        XCTAssertTrue(isIdentical(record.qkv, qkv))
+        XCTAssertEqual(y.dtype, inputs.q.dtype, "The output keeps the dtype of q.")
+        XCTAssertTrue(isIdentical(y, recorder.y.asType(inputs.q.dtype)))
+        XCTAssertTrue(isIdentical(nextState, recorder.nextState))
+    }
+
 }

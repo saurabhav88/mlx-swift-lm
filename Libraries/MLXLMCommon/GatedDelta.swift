@@ -347,7 +347,9 @@ public func gatedDeltaUpdate(
     dtBias: MLXArray,
     state: MLXArray? = nil,
     mask: MLXArray? = nil,
-    useKernel: Bool = true
+    useKernel: Bool = true,
+    recordingCache: (any GatedDeltaTapeCache)? = nil,
+    projectedQKV: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
     let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
@@ -362,6 +364,14 @@ public func gatedDeltaUpdate(
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
     if state.dtype != .float32 {
         state = state.asType(.float32)
+    }
+
+    if let recordingCache, recordingCache.isArmed {
+        precondition(projectedQKV != nil, "Tape verification needs the projected conv input")
+        let (y, nextState, tape) = recordingCache.gatedDeltaWithTape(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+        recordingCache.recordTape(tape: tape, k: k, g: g, qkv: projectedQKV!)
+        return (y.asType(q.dtype), nextState)
     }
 
     // The fused kernel distributes Dk over exactly 32 simd lanes
