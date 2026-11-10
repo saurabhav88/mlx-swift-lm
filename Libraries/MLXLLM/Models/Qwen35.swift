@@ -332,11 +332,19 @@ final class Qwen35GatedDeltaNet: Module {
         cache: MambaCache? = nil,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
+        // A cache that records the gated-delta tape (speculative decoding with tape
+        // rollback) gets one tape for the whole call. The speculative checkpoint splits the
+        // update in two, and the second half would overwrite the first half's tape, so the
+        // two modes are refused together before any cache state changes.
+        let recordingCache = cache.flatMap { $0 as? any GatedDeltaTapeCache }
+        precondition(
+            !(recordingCache?.isArmed == true && checkpointAfter != nil),
+            "An armed tape cache cannot be combined with a speculative checkpoint")
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
         let (out, newConvState, newRecState, checkpoint) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter, recordingCache: recordingCache)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
@@ -368,7 +376,8 @@ final class Qwen35GatedDeltaNet: Module {
         convState: MLXArray,
         recState: MLXArray?,
         mask: MLXArray?,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        recordingCache: (any GatedDeltaTapeCache)? = nil
     ) -> (
         output: MLXArray,
         convState: MLXArray,
@@ -458,7 +467,11 @@ final class Qwen35GatedDeltaNet: Module {
                 dtBias: dtBias,
                 state: recState,
                 mask: mask,
-                useKernel: !training)
+                useKernel: !training,
+                // `qkv` is the projected, mask-adjusted input of the conv, not its output:
+                // a rollback rebuilds the conv state from it.
+                recordingCache: recordingCache,
+                projectedQKV: qkv)
             checkpoint = nil
         }
 
@@ -676,6 +689,11 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+/// True for a cache that is currently recording the gated-delta tape.
+private func hasArmedTapeCache(_ cache: KVCache?) -> Bool {
+    (cache as? any GatedDeltaTapeCache)?.isArmed ?? false
+}
+
 // MARK: - Decoder Layer
 
 final class Qwen35DecoderLayer: Module {
@@ -731,8 +749,10 @@ final class Qwen35DecoderLayer: Module {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
         // takes the general body below.
+        // An armed tape cache must reach `gatedDeltaUpdate` with its cache, which the
+        // traced bodies cannot do (a trace is pure), so it takes the general body too.
         if x.dim(1) == 1, ssmMask == nil {
-            if isLinear, let mambaCache = cache as? MambaCache {
+            if isLinear, let mambaCache = cache as? MambaCache, !hasArmedTapeCache(mambaCache) {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
             if !isLinear, let cache, usesPlainAttentionCacheRoute(cache) {
@@ -855,10 +875,15 @@ final class Qwen35DecoderLayer: Module {
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "embed_tokens") public internal(set) var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
     let norm: RMSNorm
+
+    /// True when the model has gated-delta-net (recurrent) layers next to its attention layers.
+    public var hasLinearLayers: Bool {
+        layers.contains { $0.isLinear }
+    }
 
     let ssmIdx: Int
     let faIdx: Int
@@ -920,7 +945,10 @@ public class Qwen35TextModelInner: Module {
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
+        // The compiled whole-step schedule runs the GDN layers inside traces, where an armed
+        // tape cache cannot record; such a step takes the general path below.
         if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+            !caches.contains(where: hasArmedTapeCache),
             let step = decodeStep(inputs, caches)
         {
             return step
@@ -947,6 +975,51 @@ public class Qwen35TextModelInner: Module {
         }
 
         return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+    }
+
+    /// Backbone hidden states, plus the outputs of selected layers.
+    ///
+    /// `captureLayerIDs` are zero-based layer indices. Each captured value is that layer's
+    /// output (the residual stream after the layer), before the final normalization. The
+    /// first element of the result is the final-normalized hidden state, the same value
+    /// ``callAsFunction(_:cache:)`` returns, and the caches advance the same way.
+    ///
+    /// This is the ordinary layer loop with a tap after each layer. It never takes the
+    /// compiled whole-step schedule, which has no per-layer outputs.
+    ///
+    /// A supplied cache list must have one entry per layer; a list of another length is a
+    /// caller error and is not replaced by empty caches.
+    public func callCapturing(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        captureLayerIDs: Set<Int>
+    ) -> (MLXArray, [Int: MLXArray]) {
+        if let cache {
+            precondition(
+                cache.count == layers.count,
+                "callCapturing needs one cache entry per layer")
+        }
+        let cacheArray = cache ?? Array(repeating: nil as KVCache?, count: layers.count)
+
+        var hiddenStates = embedTokens(inputs)
+
+        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray[faIdx])
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray[ssmIdx] as? MambaCache)
+
+        var captured: [Int: MLXArray] = [:]
+        for (i, layer) in layers.enumerated() {
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask =
+                layer.isLinear
+                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            hiddenStates = layer(
+                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray[i])
+            if captureLayerIDs.contains(i) {
+                captured[i] = hiddenStates
+            }
+        }
+
+        return (norm(hiddenStates), captured)
     }
 
     // MARK: - Whole-step decode schedule
@@ -1068,7 +1141,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
 
-    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    @ModuleInfo(key: "lm_head") public internal(set) var lmHead: Linear?
 
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args

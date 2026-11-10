@@ -384,6 +384,182 @@ struct Qwen35MTPMetalTests {
     }
 }
 
+// MARK: - Tape recording and hidden-state capture
+
+// A speculative decoder with tape rollback arms a recording cache for its verification pass
+// and reads the outputs of chosen layers. The harm these tests guard against is silent: a
+// verification that skips recording, or a capture taken from the wrong layer, corrupts the
+// decoding that follows without raising an error.
+
+/// A recurrent cache that counts tape recordings. While armed it stands in for the gated
+/// delta update (zeros of the right shapes), which is enough to follow the call path.
+private final class TapeSpyCache: MambaCache, GatedDeltaTapeCache {
+    var isArmed = false
+    private(set) var recordedSteps: [(tape: Int, projectedInput: Int)] = []
+
+    func resetRecords() {
+        recordedSteps.removeAll()
+    }
+
+    func gatedDeltaWithTape(
+        q: MLXArray, k: MLXArray, v: MLXArray,
+        g: MLXArray, beta: MLXArray, state: MLXArray,
+        mask: MLXArray?
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        (
+            MLXArray.zeros(v.shape, dtype: v.dtype), state,
+            MLXArray.zeros([v.dim(0), v.dim(1), 1])
+        )
+    }
+
+    func recordTape(tape: MLXArray, k: MLXArray, g: MLXArray, qkv: MLXArray) {
+        recordedSteps.append((tape.dim(1), qkv.dim(1)))
+    }
+}
+
+/// Three recurrent layers followed by one attention layer.
+private func makeHybridQwen35(seed: UInt64, tieWordEmbeddings: Bool = true) throws
+    -> MLXLLM.Qwen35TextModel
+{
+    let cfg = try JSONDecoder().decode(
+        MLXLLM.Qwen35TextConfiguration.self,
+        from: Data(
+            qwen35TextConfigJSON(
+                mtpLayers: 0, hiddenLayers: 4, fullAttentionInterval: 4,
+                tieWordEmbeddings: tieWordEmbeddings
+            ).utf8))
+    // Task-local seed: the global random state is left alone.
+    let model = withRandomState(MLXRandom.RandomState(seed: seed)) {
+        MLXLLM.Qwen35TextModel(cfg)
+    }
+    eval(model)
+    return model
+}
+
+private func tokenRow(_ ids: [Int32]) -> MLXArray {
+    MLXArray(ids).reshaped(1, ids.count)
+}
+
+@Suite(.serialized)
+struct Qwen35TapeRecordingAndCaptureTests {
+    @Test
+    func testQwen35ArmedTapeCacheRecordsOncePerRecurrentLayer() throws {
+        let model = try makeHybridQwen35(seed: 7)
+        #expect(model.model.hasLinearLayers)
+        let caches: [KVCache?] = try model.newCache(parameters: nil).map {
+            $0 is MambaCache ? TapeSpyCache() : $0
+        }
+        let spies = caches.compactMap { $0 as? TapeSpyCache }
+        #expect(spies.count == 3)
+
+        // Disarmed control: an ordinary prefill, then an ordinary single-token step (the
+        // compiled whole-step route) and an ordinary capture. Nothing is recorded.
+        eval(model.model(tokenRow([1, 2, 3, 4, 5]), cache: caches))
+        eval(model.model(tokenRow([6]), cache: caches))
+        eval(model.model.callCapturing(tokenRow([7, 8]), cache: caches, captureLayerIDs: [0]).0)
+        #expect(spies.allSatisfy { $0.recordedSteps.isEmpty })
+
+        spies.forEach { $0.isArmed = true }
+
+        // Whole-model single-token forward: must leave the compiled whole-step route.
+        eval(model.model(tokenRow([9]), cache: caches))
+        for spy in spies {
+            #expect(spy.recordedSteps.count == 1)
+            #expect(spy.recordedSteps.first?.tape == 1)
+            #expect(spy.recordedSteps.first?.projectedInput == 1)
+            spy.resetRecords()
+        }
+
+        // Single-token capture: must leave the compiled single-layer route.
+        eval(model.model.callCapturing(tokenRow([10]), cache: caches, captureLayerIDs: [1]).0)
+        for spy in spies {
+            #expect(spy.recordedSteps.count == 1)
+            #expect(spy.recordedSteps.first?.projectedInput == 1)
+            spy.resetRecords()
+        }
+
+        // Multi-token capture: one tape for the whole block, with the complete projected
+        // input of the block.
+        eval(
+            model.model.callCapturing(
+                tokenRow([11, 12, 13]), cache: caches, captureLayerIDs: [1]
+            ).0)
+        for spy in spies {
+            #expect(spy.recordedSteps.count == 1)
+            #expect(spy.recordedSteps.first?.tape == 3)
+            #expect(spy.recordedSteps.first?.projectedInput == 3)
+            spy.resetRecords()
+        }
+
+        // Disarmed again: back to no recording.
+        spies.forEach { $0.isArmed = false }
+        eval(model.model(tokenRow([14]), cache: caches))
+        #expect(spies.allSatisfy { $0.recordedSteps.isEmpty })
+    }
+
+    @Test
+    func testQwen35CapturingMatchesOrdinaryForwardAndCacheState() throws {
+        let model = try makeHybridQwen35(seed: 11)
+        let tokens = tokenRow([1, 2, 3, 4, 5])
+        let ordinaryCaches = try model.newCache(parameters: nil)
+        let capturingCaches = try model.newCache(parameters: nil)
+
+        let ordinary = model.model(tokens, cache: ordinaryCaches)
+        let (hidden, captured) = model.model.callCapturing(
+            tokens, cache: capturingCaches, captureLayerIDs: [0, 3])
+        eval(ordinary, hidden)
+
+        #expect(allClose(hidden, ordinary, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        for (capturing, plain) in zip(capturingCaches, ordinaryCaches) {
+            #expect(capturing.offset == plain.offset)
+            #expect(capturing.state.count == plain.state.count)
+            for (a, b) in zip(capturing.state, plain.state) {
+                #expect(allClose(a, b, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            }
+        }
+
+        // Zero-based keys, the selected layers only.
+        #expect(Set(captured.keys) == [0, 3])
+        let first = try #require(captured[0])
+        let last = try #require(captured[3])
+        #expect(first.shape == [1, 5, 16])
+        // Layer 3 is the last layer: its captured residual, normalized, is the result.
+        #expect(allClose(model.model.norm(last), hidden, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        // The first layer's output is a different value, so the keys are not mixed up.
+        #expect(!allClose(first, last, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+    }
+
+    @Test
+    func testQwen35PublicEmbeddingAndHeadReproduceLogits() throws {
+        let tokens = tokenRow([1, 2, 3, 4])
+        for tieWordEmbeddings in [true, false] {
+            let model = try makeHybridQwen35(seed: 13, tieWordEmbeddings: tieWordEmbeddings)
+            #expect((model.lmHead == nil) == tieWordEmbeddings)
+            #expect(Qwen35DFlashPublicAPIProbe.isHybrid(model))
+
+            let logits = model(tokens, cache: nil)
+            let hidden = model.model(tokens, cache: nil)
+            let viaPublicAccess = Qwen35DFlashPublicAPIProbe.logits(model, hidden)
+            let captureCaches = try model.newCache(parameters: nil)
+            let (viaCapture, captured) = Qwen35DFlashPublicAPIProbe.forwardWithCapture(
+                model, inputIDs: tokens, cache: captureCaches, captureLayerIDs: [2])
+            eval(logits, viaPublicAccess, viaCapture)
+
+            #expect(allClose(viaPublicAccess, logits, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            #expect(allClose(viaCapture, logits, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            #expect(Set(captured.keys) == [2])
+            #expect(
+                Qwen35DFlashPublicAPIProbe.embed(model, tokens).shape == [1, 4, 16])
+        }
+
+        // The existing fixture default is one full-attention layer: not hybrid.
+        let attentionOnly = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 0).utf8))
+        #expect(!Qwen35DFlashPublicAPIProbe.isHybrid(MLXLLM.Qwen35TextModel(attentionOnly)))
+    }
+}
+
 @Suite(.serialized)
 struct Qwen35MTPRegistrationTests {
     @Test
@@ -437,13 +613,16 @@ struct Qwen35MTPRegistrationTests {
 private func qwen35TextConfigJSON(
     mtpLayers: Int,
     mtpUseDedicatedEmbeddings: Bool = false,
-    numExperts: Int = 0
+    numExperts: Int = 0,
+    hiddenLayers: Int = 1,
+    fullAttentionInterval: Int = 1,
+    tieWordEmbeddings: Bool = true
 ) -> String {
     """
     {
       "model_type": "qwen3_5_text",
       "hidden_size": 16,
-      "num_hidden_layers": 1,
+      "num_hidden_layers": \(hiddenLayers),
       "intermediate_size": 32,
       "num_attention_heads": 2,
       "num_key_value_heads": 1,
@@ -458,9 +637,9 @@ private func qwen35TextConfigJSON(
       "rope_theta": 100000.0,
       "partial_rotary_factor": 0.25,
       "max_position_embeddings": 64,
-      "tie_word_embeddings": true,
+      "tie_word_embeddings": \(tieWordEmbeddings),
       "attention_bias": false,
-      "full_attention_interval": 1,
+      "full_attention_interval": \(fullAttentionInterval),
       "mtp_num_hidden_layers": \(mtpLayers),
       "mtp_use_dedicated_embeddings": \(mtpUseDedicatedEmbeddings),
       "num_experts": \(numExperts),
