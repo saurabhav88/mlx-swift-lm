@@ -62,10 +62,11 @@ let package = Package(
     ],
     dependencies: [
         // Envious Labs fork: 0.31.6 with the CUDA build plugin attached only on Linux (no Xcode plugin
-        // trust prompt on Apple platforms).
+        // trust prompt on Apple platforms), plus the upstream #461 compiler-lock backport
+        // (CompiledFunction.lock / evalLock ordering).
         .package(
             url: "https://github.com/saurabhav88/mlx-swift",
-            revision: "8746d3d8d2f3a19c79276f6d884b8c9c02e751e2"),
+            revision: "b2de81fbb2b8d250bff2eea9659ddfc7fdb4ebec"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
