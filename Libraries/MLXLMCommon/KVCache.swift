@@ -1383,7 +1383,10 @@ public class ChunkedKVCache: KVCacheSimple {
 }
 
 /// Base cache for array-based state storage
-public class ArraysCache: BaseKVCache {
+///
+/// `open` only because `MambaCache` is: Swift requires the superclass of an open class to be
+/// open. Its members stay `public`, so a subclass in another module cannot override them.
+open class ArraysCache: BaseKVCache {
     fileprivate var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
@@ -1577,7 +1580,11 @@ public class ArraysCache: BaseKVCache {
 }
 
 /// Simple cache for Mamba-style state space models
-public class MambaCache: ArraysCache {
+///
+/// `open` so a decoder in another module can supply a rollback-capable subclass with its own
+/// snapshot and `trim`. The members declared here stay `public` or `package`: the sequence
+/// metadata, `copy()` and the speculative checkpoint cannot be overridden from outside.
+open class MambaCache: ArraysCache {
     private struct SpeculativeCheckpoint {
         var state: [MLXArray?]
         var offset: Int

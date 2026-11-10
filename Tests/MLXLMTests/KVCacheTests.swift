@@ -996,6 +996,172 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     assertArraysClose(restored.state, cache.state)
 }
 
+// MARK: - MambaCache extension boundary and checkpoint metadata
+
+// A decoder in another module (speculative decoding with its own rollback cache) subclasses
+// `MambaCache`. These tests pin what such a subclass inherits. The harm they guard against is
+// silent: recurrent tensors restored next to the wrong offset, padding or lengths change the
+// text that follows without raising any error.
+
+@Test func testOrdinaryMambaCacheStaysNonTrimmable() throws {
+    let mamba = MambaCache(leftPadding: [2])
+    mamba.prepare(lengths: [5])
+    mamba.offset = 4
+    let conv = deterministicTensor(shape: [1, 3, 4], salt: 1)
+    let recurrent = deterministicTensor(shape: [1, 1, 4, 4], salt: 2)
+    mamba[0] = conv
+    mamba[1] = recurrent
+
+    #expect(!mamba.isTrimmable)
+    #expect(!mamba.isTrimmable(after: 1))
+    #expect(mamba.trim(3) == 0)
+    #expect(mamba.offset == 4)
+    #expect(mamba.leftPaddingValues == [2])
+    #expect(mamba.lengthsValues == [5])
+
+    // The attention cache can trim on its own. A list that also holds a recurrent cache is
+    // rejected whole, so the attention entry must stay untouched as well.
+    let attention = KVCacheSimple()
+    _ = attention.update(
+        keys: deterministicTensor(shape: [1, 2, 6, 4], salt: 3),
+        values: deterministicTensor(shape: [1, 2, 6, 4], salt: 4))
+    #expect(attention.isTrimmable)
+    #expect(attention.offset == 6)
+
+    let caches: [any KVCache] = [attention, mamba]
+    #expect(!canTrimPromptCache(caches))
+    #expect(trimPromptCache(caches, numTokens: 2) == 0)
+
+    #expect(attention.offset == 6)
+    #expect(attention.state.first?.dim(2) == 6)
+    #expect(mamba.offset == 4)
+    #expect(mamba.leftPaddingValues == [2])
+    #expect(mamba.lengthsValues == [5])
+    assertArraysClose([try #require(mamba[0]), try #require(mamba[1])], [conv, recurrent])
+}
+
+@Test func testMambaSpeculativeCheckpointRestoresSlotsAndMetadataOnce() throws {
+    let cache = MambaCache(leftPadding: [3, 1])
+    cache.prepare(lengths: [5, 4])
+    cache.offset = 7
+    let prefixConv = deterministicTensor(shape: [2, 3, 4], salt: 11)
+    let prefixRecurrent = deterministicTensor(shape: [2, 1, 4, 4], salt: 12)
+
+    // The order the gated delta net layer uses: checkpoint the state after the committed
+    // prefix, then store the full-input state and advance over the whole input.
+    cache.saveSpeculativeCheckpoint(
+        convState: prefixConv, recurrentState: prefixRecurrent, advancedBy: 1)
+    #expect(cache.hasSpeculativeCheckpoint)
+    cache[0] = deterministicTensor(shape: [2, 3, 4], salt: 21)
+    cache[1] = deterministicTensor(shape: [2, 1, 4, 4], salt: 22)
+    cache.advance(2)
+    cache.offset = 9
+    #expect(cache.leftPaddingValues == [1, -1])
+    #expect(cache.lengthsValues == [3, 2])
+
+    #expect(cache.restoreSpeculativeCheckpoint())
+
+    assertArraysClose(
+        [try #require(cache[0]), try #require(cache[1])], [prefixConv, prefixRecurrent])
+    // The offset comes back as it was when the checkpoint was taken; padding and lengths
+    // come back advanced by the committed prefix only.
+    #expect(cache.offset == 7)
+    #expect(cache.leftPaddingValues == [2, 0])
+    #expect(cache.lengthsValues == [4, 3])
+    #expect(!cache.hasSpeculativeCheckpoint)
+
+    // One-shot: a second restore finds nothing and changes nothing.
+    let later = deterministicTensor(shape: [2, 3, 4], salt: 23)
+    cache[0] = later
+    cache.advance(1)
+    #expect(!cache.restoreSpeculativeCheckpoint())
+    assertArraysClose([try #require(cache[0]), try #require(cache[1])], [later, prefixRecurrent])
+    #expect(cache.offset == 7)
+    #expect(cache.leftPaddingValues == [1, -1])
+    #expect(cache.lengthsValues == [3, 2])
+}
+
+@Test func testMambaCacheCopyKeepsSparseSlotsAndCarriesNoPendingCheckpoint() throws {
+    let cache = MambaCache(leftPadding: [2, 0])
+    cache.prepare(lengths: [5, 3])
+    cache.offset = 6
+    let recurrent = deterministicTensor(shape: [2, 1, 4, 4], salt: 31)
+    // Slot 0 (the conv state) stays nil; the copy must keep that position empty.
+    cache[1] = recurrent
+    let checkpointConv = deterministicTensor(shape: [2, 3, 4], salt: 32)
+    cache.saveSpeculativeCheckpoint(
+        convState: checkpointConv,
+        recurrentState: deterministicTensor(shape: [2, 1, 4, 4], salt: 33),
+        advancedBy: 1)
+
+    let copied = try #require(cache.copy() as? MambaCache)
+
+    #expect(copied.slotCount == 2)
+    #expect(copied[0] == nil)
+    assertArraysClose([try #require(copied[1])], [recurrent])
+    #expect(copied.offset == 6)
+    #expect(copied.leftPaddingValues == [2, 0])
+    #expect(copied.lengthsValues == [5, 3])
+    #expect(!copied.hasSpeculativeCheckpoint)
+    #expect(!copied.restoreSpeculativeCheckpoint())
+
+    // The source moves on and then restores; the copy keeps what it was given.
+    cache[1] = deterministicTensor(shape: [2, 1, 4, 4], salt: 34)
+    cache.advance(2)
+    cache.offset = 9
+    #expect(cache.restoreSpeculativeCheckpoint())
+    assertArraysClose([try #require(cache[0])], [checkpointConv])
+    #expect(cache.offset == 6)
+    #expect(cache.leftPaddingValues == [1, -1])
+    #expect(cache.lengthsValues == [4, 2])
+
+    #expect(copied[0] == nil)
+    assertArraysClose([try #require(copied[1])], [recurrent])
+    #expect(copied.offset == 6)
+    #expect(copied.leftPaddingValues == [2, 0])
+    #expect(copied.lengthsValues == [5, 3])
+    #expect(!copied.hasSpeculativeCheckpoint)
+}
+
+@Test func testExternalMambaSubclassOverridesTrimAndInheritsTheRest() throws {
+    // `ExternalRollbackProbeCache` is declared in a file that imports MLXLMCommon without
+    // `@testable`, so it stands for a subclass in another module.
+    let probe = ExternalRollbackProbeCache(leftPadding: [1])
+    probe.prepare(lengths: [4])
+    probe.offset = 5
+    let conv = deterministicTensor(shape: [1, 3, 4], salt: 41)
+    probe[0] = conv
+
+    // Inherited behaviour is the ordinary cache's.
+    #expect(!probe.isTrimmable)
+    probe.advance(1)
+    #expect(probe.offset == 5)
+    #expect(probe.leftPaddingValues == [0])
+    #expect(probe.lengthsValues == [3])
+    let copied = try #require(probe.copy() as? MambaCache)
+    #expect(!(copied is ExternalRollbackProbeCache))
+    assertArraysClose([try #require(copied[0])], [conv])
+    #expect(copied[1] == nil)
+
+    // A caller that only knows the protocol reaches the subclass's `trim`.
+    let erased: any KVCache = probe
+    #expect(erased.trim(2) == 2)
+    #expect(probe.trimRequests == [2])
+    #expect(probe.offset == 3)
+
+    // Overriding `trim` does not change the trimmability policy.
+    #expect(trimPromptCache([erased], numTokens: 1) == 0)
+    #expect(probe.trimRequests == [2])
+    #expect(probe.offset == 3)
+
+    // The base class still ignores `trim`.
+    let plain = MambaCache()
+    plain.offset = 5
+    let erasedPlain: any KVCache = plain
+    #expect(erasedPlain.trim(2) == 0)
+    #expect(plain.offset == 5)
+}
+
 // MARK: - CacheList with KV caches
 
 @Test func testCacheListKVCaches() throws {
