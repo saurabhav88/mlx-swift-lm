@@ -61,11 +61,12 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // Envious Labs fork: 0.33.0 plus one repair of the JIT source of the head-dim-split
-        // attention kernel (ml-explore/mlx issue 4832).
+        // Envious Labs fork: 0.33.0 plus two repairs of JIT kernel sources: the head-dim-split
+        // attention kernel (ml-explore/mlx issue 4832) and the steel integral-constant operators
+        // on macOS 14's Metal compiler (ml-explore/mlx-swift issue 497).
         .package(
             url: "https://github.com/saurabhav88/mlx-swift",
-            revision: "5efce04eee3227b0d81473ad1738a01aa8072272"),
+            revision: "bedcf0103dd0ca7a1b73b4d8bd272195d3f8c810"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
