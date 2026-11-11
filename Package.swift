@@ -61,12 +61,11 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // Envious Labs fork: 0.31.6 with the CUDA build plugin attached only on Linux (no Xcode plugin
-        // trust prompt on Apple platforms), plus the upstream #461 compiler-lock backport
-        // (CompiledFunction.lock / evalLock ordering).
+        // Envious Labs fork: 0.33.0 plus one repair of the JIT source of the head-dim-split
+        // attention kernel (ml-explore/mlx issue 4832).
         .package(
             url: "https://github.com/saurabhav88/mlx-swift",
-            revision: "b2de81fbb2b8d250bff2eea9659ddfc7fdb4ebec"),
+            revision: "5efce04eee3227b0d81473ad1738a01aa8072272"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
